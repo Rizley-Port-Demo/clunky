@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EC2 infrastructure for the fastapi application.
+  Includes VPC, ALB, Auto Scaling Group, and EC2 instances
+  running the app via Docker on t3.small.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  AppName:
+    Type: String
+    Default: "fastapi-app"
+  Environment:
+    Type: String
+    Default: "production"
+  InstanceType:
+    Type: String
+    Default: "t3.small"
+  AppPort:
+    Type: Number
+    Default: 8000
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 2
+  AsgMinSize:
+    Type: Number
+    Default: 1
+  AsgMaxSize:
+    Type: Number
+    Default: 4
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+  PublicSubnet1Cidr:
+    Type: String
+    Default: "10.0.1.0/24"
+  PublicSubnet2Cidr:
+    Type: String
+    Default: "10.0.2.0/24"
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: "10.0.3.0/24"
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: "10.0.4.0/24"
+  # Latest Amazon Linux 2023 AMI — update per region as needed
+  Ec2AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # ── VPC & networking ──────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-${Environment}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-public-2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-private-2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── Security groups ───────────────────────────────────────────────
+
+  # ALB: accepts HTTP/HTTPS from the internet
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB — allow HTTP and HTTPS from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-alb-sg"
+
+  # EC2: accepts app traffic only from the ALB
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 instances — allow app port from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-ec2-sg"
+
+  # ── IAM — EC2 instance profile ─────────────────────────────────────
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM Session Manager — SSH-free access
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # Pull images from ECR
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        # Write app logs to CloudWatch
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  # ── CloudWatch Log Group ──────────────────────────────────────────
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/app/${AppName}/${Environment}"
+      RetentionInDays: 30
+
+  # ── Launch Template ───────────────────────────────────────────────
+  # UserData installs Docker and starts the app container.
+  # The start command differs per framework (resolved at action runtime).
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AppName}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref Ec2AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt Ec2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref Ec2SecurityGroup
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2 enforced
+          HttpPutResponseHopLimit: 1
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+
+            # System update & Docker install
+            dnf update -y
+            dnf install -y docker amazon-cloudwatch-agent
+            systemctl enable --now docker
+
+            # Pull and run the app container
+            # IMAGE_URI is injected at deploy time via cfn parameter override
+            # or set manually after initial launch
+            IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/fastapi-app:latest"
+
+            aws ecr get-login-password --region ${AWS::Region} |               docker login --username AWS --password-stdin               "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+
+            docker run -d               --name fastapi-app               --restart unless-stopped               -p 8000:8000               --log-driver awslogs               --log-opt awslogs-region=${AWS::Region}               --log-opt awslogs-group=/app/fastapi-app/production               "$IMAGE_URI"
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${AppName}-${Environment}"
+              - Key: Framework
+                Value: fastapi
+              - Key: Environment
+                Value: !Ref Environment
+
+  # ── ALB ───────────────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AppName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AppName}-tg"
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+      HealthCheckPath: "/health"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── Auto Scaling Group ────────────────────────────────────────────
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AppName}-asg"
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT2M
+
+  # CPU-based scaling policy
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  ALBDnsName:
+    Value: !GetAtt ALB.DNSName
+    Description: Public DNS name of the Application Load Balancer
+    Export:
+      Name: !Sub "${AWS::StackName}-AlbDns"
+
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroupArn"
+
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AsgName"
+
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  AppLogGroup:
+    Value: !Ref AppLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"
